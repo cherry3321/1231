@@ -3,14 +3,16 @@ from flask_socketio import SocketIO, emit, join_room, leave_room
 from flask_sqlalchemy import SQLAlchemy
 from flask_bcrypt import Bcrypt
 from datetime import datetime
-import os, uuid, json
+import os, uuid, re
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'super-secret-key-messenger-2024'
+app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'super-secret-key-messenger-2024')
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///messenger.db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['UPLOAD_FOLDER'] = 'static/uploads'
-app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB
+app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024
+app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
+app.config['SESSION_COOKIE_SECURE'] = False
 
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
@@ -18,16 +20,16 @@ db = SQLAlchemy(app)
 bcrypt = Bcrypt(app)
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 
-# ─── Models ───────────────────────────────────────────────────────────────────
-
 class User(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     username = db.Column(db.String(50), unique=True, nullable=False)
+    display_name = db.Column(db.String(80), default='')
     email = db.Column(db.String(120), unique=True, nullable=False)
     password = db.Column(db.String(200), nullable=False)
     avatar_color = db.Column(db.String(20), default='#5B9BD5')
+    avatar_url = db.Column(db.String(300), default='')
     bio = db.Column(db.String(200), default='')
-    status = db.Column(db.String(20), default='online')  # online, offline, away
+    status = db.Column(db.String(20), default='online')
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     socket_id = db.Column(db.String(100), default='')
 
@@ -35,8 +37,10 @@ class User(db.Model):
         return {
             'id': self.id,
             'username': self.username,
+            'display_name': self.display_name or self.username,
             'email': self.email,
             'avatar_color': self.avatar_color,
+            'avatar_url': self.avatar_url or '',
             'bio': self.bio,
             'status': self.status,
             'created_at': self.created_at.isoformat()
@@ -48,6 +52,7 @@ class Chat(db.Model):
     is_group = db.Column(db.Boolean, default=False)
     description = db.Column(db.String(300), default='')
     avatar_color = db.Column(db.String(20), default='#5B9BD5')
+    avatar_url = db.Column(db.String(300), default='')
     created_by = db.Column(db.Integer, db.ForeignKey('user.id'))
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     members = db.relationship('ChatMember', backref='chat', lazy=True, cascade='all, delete-orphan')
@@ -65,7 +70,7 @@ class Message(db.Model):
     chat_id = db.Column(db.Integer, db.ForeignKey('chat.id'), nullable=False)
     sender_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
     content = db.Column(db.Text, default='')
-    msg_type = db.Column(db.String(20), default='text')  # text, image, file, audio
+    msg_type = db.Column(db.String(20), default='text')
     file_url = db.Column(db.String(300), default='')
     file_name = db.Column(db.String(200), default='')
     file_size = db.Column(db.Integer, default=0)
@@ -75,20 +80,15 @@ class Message(db.Model):
     def to_dict(self):
         sender = User.query.get(self.sender_id)
         return {
-            'id': self.id,
-            'chat_id': self.chat_id,
+            'id': self.id, 'chat_id': self.chat_id,
             'sender_id': self.sender_id,
-            'sender_username': sender.username if sender else 'Unknown',
+            'sender_username': (sender.display_name or sender.username) if sender else 'Unknown',
             'sender_color': sender.avatar_color if sender else '#999',
-            'content': self.content,
-            'msg_type': self.msg_type,
-            'file_url': self.file_url,
-            'file_name': self.file_name,
-            'file_size': self.file_size,
-            'created_at': self.created_at.isoformat()
+            'sender_avatar_url': sender.avatar_url if sender else '',
+            'content': self.content, 'msg_type': self.msg_type,
+            'file_url': self.file_url, 'file_name': self.file_name,
+            'file_size': self.file_size, 'created_at': self.created_at.isoformat()
         }
-
-# ─── Auth Routes ──────────────────────────────────────────────────────────────
 
 @app.route('/')
 def index():
@@ -98,27 +98,29 @@ def index():
 def register():
     data = request.json
     username = data.get('username', '').strip()
+    display_name = data.get('display_name', '').strip()
     email = data.get('email', '').strip()
     password = data.get('password', '')
-
     if not username or not email or not password:
         return jsonify({'error': 'Все поля обязательны'}), 400
     if len(username) < 3:
-        return jsonify({'error': 'Имя пользователя минимум 3 символа'}), 400
+        return jsonify({'error': 'Логин минимум 3 символа'}), 400
     if len(password) < 6:
         return jsonify({'error': 'Пароль минимум 6 символов'}), 400
+    if not re.match(r'^[a-zA-Z0-9_]+$', username):
+        return jsonify({'error': 'Логин: только латиница, цифры и _'}), 400
     if User.query.filter_by(username=username).first():
-        return jsonify({'error': 'Имя пользователя уже занято'}), 400
+        return jsonify({'error': 'Логин уже занят'}), 400
     if User.query.filter_by(email=email).first():
         return jsonify({'error': 'Email уже используется'}), 400
-
     colors = ['#5B9BD5','#E8533F','#4CAF82','#9C6DD8','#F5A623','#00BCD4','#E91E8C','#FF7043']
     hashed = bcrypt.generate_password_hash(password).decode('utf-8')
-    user = User(username=username, email=email, password=hashed,
-                avatar_color=colors[len(username) % len(colors)])
+    user = User(username=username, display_name=display_name or username,
+                email=email, password=hashed, avatar_color=colors[len(username) % len(colors)])
     db.session.add(user)
     db.session.commit()
     session['user_id'] = user.id
+    session.permanent = True
     return jsonify({'user': user.to_dict()})
 
 @app.route('/api/login', methods=['POST'])
@@ -128,8 +130,9 @@ def login():
     password = data.get('password', '')
     user = User.query.filter_by(username=username).first()
     if not user or not bcrypt.check_password_hash(user.password, password):
-        return jsonify({'error': 'Неверное имя или пароль'}), 401
+        return jsonify({'error': 'Неверный логин или пароль'}), 401
     session['user_id'] = user.id
+    session.permanent = True
     user.status = 'online'
     db.session.commit()
     return jsonify({'user': user.to_dict()})
@@ -151,6 +154,8 @@ def me():
     if not uid:
         return jsonify({'error': 'Не авторизован'}), 401
     user = User.query.get(uid)
+    if not user:
+        return jsonify({'error': 'Не авторизован'}), 401
     return jsonify({'user': user.to_dict()})
 
 @app.route('/api/update_profile', methods=['POST'])
@@ -164,11 +169,17 @@ def update_profile():
         user.bio = data['bio'][:200]
     if 'avatar_color' in data:
         user.avatar_color = data['avatar_color']
+    if 'avatar_url' in data:
+        user.avatar_url = data['avatar_url']
+    if 'display_name' in data:
+        user.display_name = data['display_name'][:80]
     if 'username' in data:
         new_name = data['username'].strip()
         if new_name and new_name != user.username:
+            if not re.match(r'^[a-zA-Z0-9_]+$', new_name):
+                return jsonify({'error': 'Логин: только латиница, цифры и _'}), 400
             if User.query.filter_by(username=new_name).first():
-                return jsonify({'error': 'Имя занято'}), 400
+                return jsonify({'error': 'Логин занят'}), 400
             user.username = new_name
     if 'new_password' in data and data['new_password']:
         if len(data['new_password']) < 6:
@@ -177,7 +188,27 @@ def update_profile():
     db.session.commit()
     return jsonify({'user': user.to_dict()})
 
-# ─── Chat Routes ──────────────────────────────────────────────────────────────
+@app.route('/api/upload_avatar', methods=['POST'])
+def upload_avatar():
+    uid = session.get('user_id')
+    if not uid:
+        return jsonify({'error': 'Не авторизован'}), 401
+    if 'avatar' not in request.files:
+        return jsonify({'error': 'Нет файла'}), 400
+    f = request.files['avatar']
+    if not f.filename:
+        return jsonify({'error': 'Пустой файл'}), 400
+    ext = os.path.splitext(f.filename)[1].lower()
+    if ext not in ['.jpg', '.jpeg', '.png', '.gif', '.webp']:
+        return jsonify({'error': 'Только изображения (jpg, png, gif, webp)'}), 400
+    fname = f"avatar_{uid}_{uuid.uuid4().hex[:8]}{ext}"
+    path = os.path.join(app.config['UPLOAD_FOLDER'], fname)
+    f.save(path)
+    url = f'/static/uploads/{fname}'
+    user = User.query.get(uid)
+    user.avatar_url = url
+    db.session.commit()
+    return jsonify({'url': url, 'user': user.to_dict()})
 
 @app.route('/api/chats')
 def get_chats():
@@ -192,28 +223,23 @@ def get_chats():
             continue
         last_msg = Message.query.filter_by(chat_id=chat.id).order_by(Message.created_at.desc()).first()
         unread = Message.query.filter_by(chat_id=chat.id, is_read=False).filter(Message.sender_id != uid).count()
-
         if chat.is_group:
             name = chat.name
             color = chat.avatar_color
+            avatar_url = chat.avatar_url or ''
         else:
             other_member = ChatMember.query.filter(
-                ChatMember.chat_id == chat.id,
-                ChatMember.user_id != uid
-            ).first()
+                ChatMember.chat_id == chat.id, ChatMember.user_id != uid).first()
             other_user = User.query.get(other_member.user_id) if other_member else None
-            name = other_user.username if other_user else 'Unknown'
+            name = (other_user.display_name or other_user.username) if other_user else 'Unknown'
             color = other_user.avatar_color if other_user else '#999'
-
+            avatar_url = other_user.avatar_url if other_user else ''
         result.append({
-            'id': chat.id,
-            'name': name,
-            'is_group': chat.is_group,
-            'description': chat.description,
-            'avatar_color': color,
+            'id': chat.id, 'name': name, 'is_group': chat.is_group,
+            'description': chat.description, 'avatar_color': color,
+            'avatar_url': avatar_url,
             'last_message': last_msg.to_dict() if last_msg else None,
-            'unread_count': unread,
-            'created_at': chat.created_at.isoformat()
+            'unread_count': unread, 'created_at': chat.created_at.isoformat()
         })
     result.sort(key=lambda x: x['last_message']['created_at'] if x['last_message'] else x['created_at'], reverse=True)
     return jsonify({'chats': result})
@@ -227,7 +253,6 @@ def get_messages(chat_id):
     if not member:
         return jsonify({'error': 'Нет доступа'}), 403
     msgs = Message.query.filter_by(chat_id=chat_id).order_by(Message.created_at.asc()).all()
-    # Mark as read
     Message.query.filter_by(chat_id=chat_id, is_read=False).filter(
         Message.sender_id != uid).update({'is_read': True})
     db.session.commit()
@@ -247,7 +272,7 @@ def chat_info(chat_id):
     return jsonify({'chat': {
         'id': chat.id, 'name': chat.name, 'is_group': chat.is_group,
         'description': chat.description, 'avatar_color': chat.avatar_color,
-        'created_by': chat.created_by, 'members': members
+        'avatar_url': chat.avatar_url or '', 'created_by': chat.created_by, 'members': members
     }})
 
 @app.route('/api/create_direct', methods=['POST'])
@@ -262,8 +287,6 @@ def create_direct():
         return jsonify({'error': 'Пользователь не найден'}), 404
     if target.id == uid:
         return jsonify({'error': 'Нельзя написать себе'}), 400
-
-    # Check if DM already exists
     my_chats = [m.chat_id for m in ChatMember.query.filter_by(user_id=uid).all()]
     their_chats = [m.chat_id for m in ChatMember.query.filter_by(user_id=target.id).all()]
     common = set(my_chats) & set(their_chats)
@@ -271,7 +294,6 @@ def create_direct():
         c = Chat.query.get(cid)
         if c and not c.is_group:
             return jsonify({'chat_id': cid, 'existing': True})
-
     chat = Chat(is_group=False, created_by=uid)
     db.session.add(chat)
     db.session.flush()
@@ -291,19 +313,16 @@ def create_group():
     members_usernames = data.get('members', [])
     if not name:
         return jsonify({'error': 'Название обязательно'}), 400
-
     colors = ['#5B9BD5','#E8533F','#4CAF82','#9C6DD8','#F5A623','#00BCD4']
     chat = Chat(name=name, description=description, is_group=True,
                 created_by=uid, avatar_color=colors[len(name) % len(colors)])
     db.session.add(chat)
     db.session.flush()
     db.session.add(ChatMember(chat_id=chat.id, user_id=uid, is_admin=True))
-
     for uname in members_usernames:
         u = User.query.filter_by(username=uname.strip()).first()
         if u and u.id != uid:
             db.session.add(ChatMember(chat_id=chat.id, user_id=u.id))
-
     db.session.commit()
     return jsonify({'chat_id': chat.id})
 
@@ -337,8 +356,6 @@ def upload_file():
 def serve_upload(filename):
     return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
 
-# ─── SocketIO Events ──────────────────────────────────────────────────────────
-
 @socketio.on('connect')
 def on_connect():
     uid = session.get('user_id')
@@ -348,7 +365,6 @@ def on_connect():
             user.status = 'online'
             user.socket_id = request.sid
             db.session.commit()
-            # Join all user's chat rooms
             memberships = ChatMember.query.filter_by(user_id=uid).all()
             for m in memberships:
                 join_room(f'chat_{m.chat_id}')
@@ -375,16 +391,13 @@ def handle_message(data):
     file_url = data.get('file_url', '')
     file_name = data.get('file_name', '')
     file_size = data.get('file_size', 0)
-
     member = ChatMember.query.filter_by(chat_id=chat_id, user_id=uid).first()
     if not member:
         return
-
     msg = Message(chat_id=chat_id, sender_id=uid, content=content,
                   msg_type=msg_type, file_url=file_url, file_name=file_name, file_size=file_size)
     db.session.add(msg)
     db.session.commit()
-
     emit('new_message', msg.to_dict(), room=f'chat_{chat_id}')
 
 @socketio.on('typing')
@@ -393,7 +406,7 @@ def handle_typing(data):
     if not uid:
         return
     user = User.query.get(uid)
-    emit('user_typing', {'user_id': uid, 'username': user.username, 'chat_id': data.get('chat_id')},
+    emit('user_typing', {'user_id': uid, 'username': user.display_name or user.username, 'chat_id': data.get('chat_id')},
          room=f'chat_{data.get("chat_id")}', include_self=False)
 
 @socketio.on('join_chat')
@@ -403,4 +416,5 @@ def handle_join(data):
 if __name__ == '__main__':
     with app.app_context():
         db.create_all()
-    socketio.run(app, host='0.0.0.0', port=5050, debug=False, use_reloader=False, allow_unsafe_werkzeug=True)
+    port = int(os.environ.get('PORT', 5050))
+    socketio.run(app, host='0.0.0.0', port=port, debug=False, use_reloader=False, allow_unsafe_werkzeug=True)
